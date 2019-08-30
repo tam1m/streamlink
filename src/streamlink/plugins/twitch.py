@@ -137,17 +137,41 @@ _quality_options_schema = validate.Schema(
 
 Segment = namedtuple("Segment", "uri duration title key discontinuity scte35 byterange date map")
 
+LOW_LATENCY_MAX_LIVE_EDGE = 2
+
+
+def parse_condition(attr):
+    def wrapper(func):
+        def method(self, *args, **kwargs):
+            if hasattr(self.stream, attr) and getattr(self.stream, attr, False):
+                func(self, *args, **kwargs)
+        return method
+    return wrapper
+
 
 class TwitchM3U8Parser(M3U8Parser):
+    def __init__(self, base_uri=None, stream=None, **kwargs):
+        M3U8Parser.__init__(self, base_uri, **kwargs)
+        self.stream = stream
+
+    @parse_condition("disable_ads")
     def parse_tag_ext_x_scte35_out(self, value):
         self.state["scte35"] = True
 
     # unsure if this gets used by Twitch
+    @parse_condition("disable_ads")
     def parse_tag_ext_x_scte35_out_cont(self, value):
         self.state["scte35"] = True
 
+    @parse_condition("disable_ads")
     def parse_tag_ext_x_scte35_in(self, value):
         self.state["scte35"] = False
+
+    @parse_condition("low_latency")
+    def parse_tag_ext_x_twitch_prefetch(self, value):
+        segments = self.m3u8.segments
+        if segments:
+            segments.append(segments[-1]._replace(uri=self.uri(value)))
 
     def get_segment(self, uri):
         byterange = self.state.pop("byterange", None)
@@ -173,19 +197,18 @@ class TwitchM3U8Parser(M3U8Parser):
 
 class TwitchHLSStreamWorker(HLSStreamWorker):
     def _reload_playlist(self, text, url):
-        return load_hls_playlist(text, url, parser=TwitchM3U8Parser)
+        return load_hls_playlist(text, url, parser=TwitchM3U8Parser, stream=self.stream)
+
+    def _set_playlist_reload_time(self, playlist, sequences):
+        if not self.stream.low_latency:
+            super(TwitchHLSStreamWorker, self)._set_playlist_reload_time(playlist, sequences)
+        else:
+            self.playlist_reload_time = sequences[-1].segment.duration
 
 
 class TwitchHLSStreamWriter(HLSStreamWriter):
-    def __init__(self, *args, **kwargs):
-        HLSStreamWriter.__init__(self, *args, **kwargs)
-        options = self.session.plugins.get("twitch").options
-        self.disable_ads = options.get("disable-ads")
-        if self.disable_ads:
-            log.info("Will skip ad segments")
-
     def write(self, sequence, *args, **kwargs):
-        if self.disable_ads:
+        if self.stream.disable_ads:
             if sequence.segment.scte35 is not None:
                 self.reader.ads = sequence.segment.scte35
                 if self.reader.ads:
@@ -204,11 +227,28 @@ class TwitchHLSStreamReader(HLSStreamReader):
 
 
 class TwitchHLSStream(HLSStream):
+    def __init__(self, *args, **kwargs):
+        HLSStream.__init__(self, *args, **kwargs)
+        self.disable_ads = self.session.get_plugin_option("twitch", "disable-ads")
+        self.low_latency = self.session.get_plugin_option("twitch", "low-latency")
+
     def open(self):
+        if self.disable_ads:
+            log.info("Will skip ad segments")
+        if self.low_latency:
+            live_edge = max(1, min(LOW_LATENCY_MAX_LIVE_EDGE, self.session.options.get("hls-live-edge")))
+            self.session.options.set("hls-live-edge", live_edge)
+            self.session.options.set("hls-segment-stream-data", True)
+            log.info("Low latency streaming (HLS live edge: {0})".format(live_edge))
+
         reader = TwitchHLSStreamReader(self)
         reader.open()
 
         return reader
+
+    @classmethod
+    def _get_variant_playlist(cls, res):
+        return load_hls_playlist(res.text, base_uri=res.url)
 
 
 class UsherService(object):
@@ -368,6 +408,16 @@ class Twitch(Plugin):
         Skip embedded advertisement segments at the beginning or during a stream.
         Will cause these segments to be missing from the stream.
         """
+                       ),
+        PluginArgument("low-latency",
+                       action="store_true",
+                       help="""
+        Prefetches HLS segments and outputs segments while downloading.
+        Sets --hls-segment-stream-data to true and --hls-live-edge to {live_edge} if higher.
+
+        Note: The player's own caching settings need to be lowered as well. See the
+        --player or --player-args parameters and apply player-specific settings.
+        """.format(live_edge=LOW_LATENCY_MAX_LIVE_EDGE)
                        ))
 
     @classmethod
